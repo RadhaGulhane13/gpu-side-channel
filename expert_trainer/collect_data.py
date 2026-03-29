@@ -15,6 +15,7 @@ Output shards: {
 """
 
 import argparse
+import glob as glob_module
 import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -112,12 +113,23 @@ def main():
         revision=args.dataset_revision,
     )
 
+    # Resume: detect existing shards and count already-collected tokens
+    existing_shards = sorted(glob_module.glob(os.path.join(args.out_dir, "shard_*.pt")))
+    tokens_to_skip = 0
+    shard_idx = len(existing_shards)
+    if existing_shards:
+        for p in existing_shards:
+            d = torch.load(p, map_location="cpu", weights_only=True)
+            tokens_to_skip += d["input_tokens"].shape[0]
+        print(f"Resuming: found {len(existing_shards)} existing shards, "
+              f"skipping first {tokens_to_skip:,} tokens → starting at shard {shard_idx:05d}")
+
     # Shard accumulators
     buf_input = []
     buf_pred  = []
     buf_logits = []
-    shard_idx = 0
-    total_tokens = 0
+    total_tokens = tokens_to_skip
+    tokens_consumed = 0  # dataset tokens seen so far (skipped + collected)
 
     def flush_shard():
         nonlocal shard_idx
@@ -155,6 +167,12 @@ def main():
                 inp = chunk[:-1]   # positions 0..S-1
                 lbl = chunk[1:]    # positions 1..S  (next tokens)
                 S = len(inp)
+
+                tokens_consumed += S
+
+                # Skip chunks that were already saved in existing shards
+                if tokens_consumed <= tokens_to_skip:
+                    continue
 
                 input_tensor = torch.tensor(
                     [inp], dtype=torch.long, device=device
