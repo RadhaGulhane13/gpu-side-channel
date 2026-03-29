@@ -14,7 +14,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 
-from read_data import get_dataloader_seq
+from read_data import get_train_val_dataloaders
 
 
 @dataclass
@@ -183,56 +183,37 @@ class ExpertEncoderMultiHot(nn.Module):
         self.layer_gating = layer_gating
         if layer_gating:
             self.layer_gate = nn.Parameter(torch.zeros(num_layers))
-        self.layer_norm = nn.LayerNorm(num_experts)
+        # Per-layer learned bias: gives each transformer layer its own "view" of the expert space.
+        # Initialized to zero so the model starts from the same place as before.
+        self.layer_emb = nn.Embedding(num_layers, num_experts)
+        nn.init.zeros_(self.layer_emb.weight)
         self.layer_mlp = nn.Sequential(
             nn.Linear(num_experts, layer_hidden),
-            nn.ReLU(),
+            nn.SiLU(),
             nn.Linear(layer_hidden, layer_proj),
         )
         self.proj = nn.Linear(num_layers * layer_proj, d_model)
         self.dropout = nn.Dropout(dropout)
-        
-    
 
-    # def forward(self, expert_idx):
-    #     # expert_idx: [B, S, L, K]
-    #     bsz, seq_len, num_layers, _topk = expert_idx.shape
-    #     multihot = torch.zeros(
-    #         (bsz, seq_len, num_layers, self.num_experts),
-    #         device=expert_idx.device,
-    #         dtype=torch.float32,
-    #     )
-    #     multihot.scatter_(-1, expert_idx, 1.0)
-    #     if self.layer_gating:
-    #         gate = torch.sigmoid(self.layer_gate).view(1, 1, num_layers, 1)
-    #         multihot = multihot * gate
-    #     multihot = self.layer_norm(multihot)
-    #     layer_repr = self.layer_mlp(multihot)  # [B,S,L,P]
-    #     flat = layer_repr.reshape(bsz, seq_len, num_layers * layer_repr.size(-1))
-    #     return self.dropout(self.proj(flat))
-    
     def forward(self, expert_logits):
-        """
-        expert_logits: [B, S, L, num_experts] (raw scores or probabilities)
-        """
+        # expert_logits: [B, S, L, num_experts]
+        bsz, seq_len, num_layers, _ = expert_logits.shape
 
-        # Convert logits to probabilities if they are raw scores
-        expert_probs = torch.softmax(expert_logits, dim=-1)  # [B, S, L, num_experts]
+        # Add per-layer learned bias before softmax
+        layer_ids = torch.arange(num_layers, device=expert_logits.device)
+        layer_bias = self.layer_emb(layer_ids)  # [L, E]
+        expert_logits = expert_logits + layer_bias.unsqueeze(0).unsqueeze(0)
+
+        expert_probs = torch.softmax(expert_logits, dim=-1)
 
         if self.layer_gating:
             gate = torch.sigmoid(self.layer_gate).view(1, 1, self.num_layers, 1)
             expert_probs = expert_probs * gate
 
-        # LayerNorm across experts
-        # expert_probs = self.layer_norm(expert_probs)
         expert_probs = nn.functional.layer_norm(expert_probs, expert_probs.shape[-1:])
-
-        # Pass through MLP for each layer independently
         layer_repr = self.layer_mlp(expert_probs)  # [B, S, L, P]
 
-        # Flatten layers and project to d_model
-        bsz, seq_len, num_layers, proj_dim = layer_repr.shape
-        flat = layer_repr.reshape(bsz, seq_len, num_layers * proj_dim)
+        flat = layer_repr.reshape(bsz, seq_len, num_layers * layer_repr.size(-1))
         return self.dropout(self.proj(flat))
 
 
@@ -372,6 +353,49 @@ def make_trapezoidal_lr(step_idx, max_steps, warmup_ratio, warmdown_ratio):
     return 0.0
 
 
+def compute_accuracy(logits, labels, ignore_index=-100):
+    """Top-1 and top-5 accuracy over non-ignored positions."""
+    mask = (labels != ignore_index).view(-1)
+    if mask.sum() == 0:
+        return 0.0, 0.0
+    flat_logits = logits.view(-1, logits.size(-1))[mask]
+    flat_labels = labels.view(-1)[mask]
+    top1 = (flat_logits.argmax(dim=-1) == flat_labels).float().mean().item()
+    top5 = (
+        (flat_logits.topk(5, dim=-1).indices == flat_labels.unsqueeze(-1))
+        .any(-1)
+        .float()
+        .mean()
+        .item()
+    )
+    return top1, top5
+
+
+@torch.no_grad()
+def run_validation(model, val_loader, device, layers, max_batches=50):
+    model.eval()
+    total_loss, total_top1, total_top5, n = 0.0, 0.0, 0.0, 0
+    for i, batch in enumerate(val_loader):
+        if i >= max_batches:
+            break
+        labels = batch["labels"].to(device=device, dtype=torch.long, non_blocking=True)
+        expert_scores = batch["expert_logits"][:, :, :layers].to(device)
+        attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+        labels[~attention_mask] = -100
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            logits = model(expert_scores, attention_mask)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), labels.view(-1), ignore_index=-100
+            )
+        top1, top5 = compute_accuracy(logits.float(), labels)
+        total_loss += loss.item()
+        total_top1 += top1
+        total_top5 += top5
+        n += 1
+    model.train()
+    return total_loss / max(n, 1), total_top1 / max(n, 1), total_top5 / max(n, 1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="V5 encoder-only inverter (multihot + per-layer MLP)."
@@ -415,6 +439,10 @@ def main():
     parser.add_argument("--wandb-project", default="expert-inversion")
     parser.add_argument("--wandb-entity", default=None)
     parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--data-dir", default="./router_dataset_v2")
+    parser.add_argument("--val-shards", type=int, default=2)
+    parser.add_argument("--val-every", type=int, default=500)
+    parser.add_argument("--val-batches", type=int, default=50)
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -532,8 +560,12 @@ def main():
     for opt in optimizers:
         opt.zero_grad(set_to_none=True)
 
-    # for batch in stream:
-    loader = get_dataloader_seq(data_dir="./router_dataset_v2", batch_size=args.batch_size)
+    loader, val_loader = get_train_val_dataloaders(
+        data_dir=args.data_dir,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        val_shards=args.val_shards,
+    )
 
     # for batch in loader:
     #     if step >= args.steps:
@@ -653,17 +685,40 @@ def main():
             elapsed = time.time() - start_time
             lr_adam = schedulers[0].get_last_lr()[0]
             lr_muon = schedulers[1].get_last_lr()[0]
+            train_top1, train_top5 = compute_accuracy(logits.float().detach(), labels.detach())
             print(
-                f"step {step} loss {loss.item():.4f} lr_adam {lr_adam:.6e} lr_muon {lr_muon:.6e}"
+                f"step {step} loss {loss.item() * args.grad_accum:.4f} "
+                f"acc@1 {train_top1:.3f} acc@5 {train_top5:.3f} "
+                f"lr_adam {lr_adam:.6e} lr_muon {lr_muon:.6e}"
             )
             if wandb_run:
                 wandb_run.log(
                     {
                         "train/loss": loss.item() * args.grad_accum,
+                        "train/acc_top1": train_top1,
+                        "train/acc_top5": train_top5,
                         "train/lr_adam": lr_adam,
                         "train/lr_muon": lr_muon,
                         "train/step": step,
                         "train/time_elapsed_s": elapsed,
+                    },
+                    step=step,
+                )
+
+        if step % args.val_every == 0:
+            val_loss, val_top1, val_top5 = run_validation(
+                model, val_loader, device, args.layers, max_batches=args.val_batches
+            )
+            print(
+                f"  [val] step {step} loss {val_loss:.4f} acc@1 {val_top1:.3f} acc@5 {val_top5:.3f}"
+            )
+            if wandb_run:
+                wandb_run.log(
+                    {
+                        "val/loss": val_loss,
+                        "val/acc_top1": val_top1,
+                        "val/acc_top5": val_top5,
+                        "val/step": step,
                     },
                     step=step,
                 )
