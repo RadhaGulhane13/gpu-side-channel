@@ -5,12 +5,14 @@ Collect expert routing data from openai/gpt-oss-20b on vietgpt/openwebtext_en.
 For each token position t in a sequence:
   - input:  token at position t
   - label:  token at position t+1  (next token)
-  - expert_logits: raw router logits at each of the 24 MoE layers  [24, 32]
+  - expert_idx:    top-k expert indices at each of the MoE layers  [num_layers, topk]
+  - expert_scores: top-k router scores at each of the MoE layers   [num_layers, topk]
 
 Output shards: {
-    "input_tokens":   Int32  [N]
-    "pred_tokens":    Int32  [N]
-    "expert_logits":  Float16 [N, num_layers, num_experts]
+    "input_tokens":   Int32   [N]
+    "pred_tokens":    Int32   [N]
+    "expert_idx":     Int16   [N, num_layers, topk]
+    "expert_scores":  Float16 [N, num_layers, topk]
 }
 """
 
@@ -20,51 +22,6 @@ import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import load_dataset
-
-
-NUM_LAYERS = 24
-NUM_EXPERTS = 32
-
-
-class RouterCapture:
-    """Captures full router logits via MLP pre-hooks.
-
-    The MLP's forward is replaced by a MegaBlocks kernel that bypasses Python
-    module dispatch, so router forward hooks never fire.  Instead we hook the
-    MLP's *input* (pre-hook), manually run just the router linear projection on
-    those hidden states, and store the full [T, num_experts] logits.
-    """
-
-    def __init__(self, model):
-        self._logits = [None] * NUM_LAYERS
-        self._hooks = []
-        for i in range(NUM_LAYERS):
-            mlp = model.model.layers[i].mlp
-            hook = mlp.register_forward_pre_hook(self._make_hook(i, mlp.router))
-            self._hooks.append(hook)
-
-    def _make_hook(self, layer_idx, router):
-        def hook(module, args):
-            hidden_states = args[0]                          # [B, S, H]
-            bsz, seq_len, hidden_dim = hidden_states.shape
-            hs_flat = hidden_states.reshape(-1, hidden_dim)  # [B*S, H]
-            # router_logits = F.linear(hs, weight, bias): [B*S, num_experts]
-            logits = torch.nn.functional.linear(
-                hs_flat.float(),
-                router.weight.float(),
-                router.bias.float(),
-            )
-            self._logits[layer_idx] = logits.detach()
-        return hook
-
-    def get(self, seq_len):
-        """Return stacked logits [seq_len, num_layers, num_experts]."""
-        stacked = torch.stack(self._logits, dim=1)  # [T, L, E]
-        return stacked.view(seq_len, NUM_LAYERS, NUM_EXPERTS)
-
-    def remove(self):
-        for h in self._hooks:
-            h.remove()
 
 
 def main():
@@ -79,6 +36,8 @@ def main():
     parser.add_argument("--max-tokens", type=int, default=100_000_000)
     parser.add_argument("--seq-len", type=int, default=512,
                         help="chunk length for inference")
+    parser.add_argument("--topk", type=int, default=2,
+                        help="number of top experts to store per layer")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -96,21 +55,23 @@ def main():
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        revision=args.model_revision,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map={"": device},
     )
     model.eval()
+    
+    if hasattr(model.config, "output_router_logits"):
+        model.config.output_router_logits = True
 
-    capture = RouterCapture(model)
-    print(f"Hooked {NUM_LAYERS} router layers.")
+    num_layers = model.config.num_hidden_layers
+    num_experts = model.config.num_local_experts
+    print(f"Layers: {num_layers}, Experts: {num_experts}, Top-k: {args.topk}")
 
     print("Loading dataset (streaming)...")
     ds = load_dataset(
         args.dataset,
         split="train",
-        streaming=True,
-        revision=args.dataset_revision,
+        streaming=True
     )
 
     # Resume: detect existing shards and count already-collected tokens
@@ -127,7 +88,8 @@ def main():
     # Shard accumulators
     buf_input = []
     buf_pred  = []
-    buf_logits = []
+    buf_idx   = []
+    buf_scores = []
     total_tokens = tokens_to_skip
     tokens_consumed = 0  # dataset tokens seen so far (skipped + collected)
 
@@ -137,7 +99,8 @@ def main():
         payload = {
             "input_tokens":  torch.cat(buf_input).to(torch.int32),
             "pred_tokens":   torch.cat(buf_pred).to(torch.int32),
-            "expert_logits": torch.cat(buf_logits).to(torch.float16),
+            "expert_idx":    torch.cat(buf_idx).to(torch.int16),
+            "expert_scores": torch.cat(buf_scores).to(torch.float16),
         }
         torch.save(payload, path)
         n = payload["input_tokens"].shape[0]
@@ -145,7 +108,8 @@ def main():
         shard_idx += 1
         buf_input.clear()
         buf_pred.clear()
-        buf_logits.clear()
+        buf_idx.clear()
+        buf_scores.clear()
 
     with torch.inference_mode():
         for example in ds:
@@ -177,15 +141,34 @@ def main():
                 input_tensor = torch.tensor(
                     [inp], dtype=torch.long, device=device
                 )  # [1, S]
+                
 
-                model(input_tensor, use_cache=False)
+                outputs = model(
+                    input_tensor,
+                    use_cache=False,
+                    output_router_logits=True,
+                    return_dict=True,
+                )
 
-                # [S, 24, 32]
-                logits = capture.get(S).cpu()
+                # Predicted tokens: argmax over vocab at each position → [1, S]
+                preds = torch.argmax(outputs.logits, dim=-1)  # [1, S]
+
+                # router_logits: tuple of num_layers tensors, each [S, num_experts]
+                # (batch dim is folded into seq for MoE models)
+                per_layer_idx, per_layer_scores = [], []
+                for layer_logits in outputs.router_logits:
+                    scores, idx = torch.topk(layer_logits, k=args.topk, dim=-1)
+                    per_layer_idx.append(idx)       # [S, topk]
+                    per_layer_scores.append(scores)  # [S, topk]
+
+                # [S, num_layers, topk]
+                idx_stack    = torch.stack(per_layer_idx, dim=1).cpu()
+                scores_stack = torch.stack(per_layer_scores, dim=1).cpu()
 
                 buf_input.append(torch.tensor(inp, dtype=torch.int32))
                 buf_pred.append(torch.tensor(lbl, dtype=torch.int32))
-                buf_logits.append(logits)
+                buf_idx.append(idx_stack)
+                buf_scores.append(scores_stack)
 
                 total_tokens += S
 
@@ -202,7 +185,6 @@ def main():
     if buf_input:
         flush_shard()
 
-    capture.remove()
     print(f"Done. Total tokens collected: {total_tokens:,}")
 
 

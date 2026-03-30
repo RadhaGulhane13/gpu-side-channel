@@ -204,7 +204,9 @@ class ExpertEncoderMultiHot(nn.Module):
         layer_bias = self.layer_emb(layer_ids)  # [L, E]
         expert_logits = expert_logits + layer_bias.unsqueeze(0).unsqueeze(0)
 
-        expert_probs = torch.softmax(expert_logits, dim=-1)
+        # Data arrives pre-normalized (softmax over top-k in the dataloader),
+        # so we use it directly as probabilities.
+        expert_probs = expert_logits
 
         if self.layer_gating:
             gate = torch.sigmoid(self.layer_gate).view(1, 1, self.num_layers, 1)
@@ -565,6 +567,7 @@ def main():
         seq_len=args.seq_len,
         batch_size=args.batch_size,
         val_shards=args.val_shards,
+        num_experts=32,
     )
 
     # for batch in loader:
