@@ -55,9 +55,10 @@ def main():
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": device},
     )
+    model = model.to(device)
     model.eval()
     
     if hasattr(model.config, "output_router_logits"):
@@ -142,7 +143,8 @@ def main():
                     [inp], dtype=torch.long, device=device
                 )  # [1, S]
                 
-
+                # make sure model and input_tensor are on the same device
+                # print(f"Model device: {next(model.parameters()).device}, Input device: {input_tensor.device}")
                 outputs = model(
                     input_tensor,
                     use_cache=False,

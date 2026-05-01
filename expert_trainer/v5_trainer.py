@@ -436,6 +436,7 @@ def main():
     parser.add_argument("--muon-lr-factor", type=float, default=4.0)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-ratio", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=None, help="Fixed warmup steps, overrides --warmup-ratio")
     parser.add_argument("--warmdown-ratio", type=float, default=0.20)
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--wandb-project", default="expert-inversion")
@@ -544,9 +545,11 @@ def main():
     )
     optimizers = [optimizer_adam, optimizer_muon]
 
+    effective_warmup_ratio = (args.warmup_steps / args.steps) if args.warmup_steps is not None else args.warmup_ratio
+
     def lr_lambda(step_idx):
         return make_trapezoidal_lr(
-            step_idx, args.steps, args.warmup_ratio, args.warmdown_ratio
+            step_idx, args.steps, effective_warmup_ratio, args.warmdown_ratio
         )
 
     schedulers = [
